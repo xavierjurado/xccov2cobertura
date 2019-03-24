@@ -78,75 +78,31 @@ public struct CoverageArchive {
 }
 
 
-@available(OSX 10.13, *)
 func parseCoverageArchive(at fileURL: URL) throws -> CoverageArchive {
-    let pattern = "(?<lineNumber>\\d+): (?<hits>\\d+)"
-    let regex = try NSRegularExpression(pattern: pattern, options: [])
-    let viewFileList = try launchXccov(arguments: ["view", "--file-list", fileURL.path])
-
-    typealias CompletionBlockType = () throws -> CoverageArchive.FileReport
-    let group = DispatchGroup()
-    var completionBlocks = [CompletionBlockType]()
-    let completionQueue = DispatchQueue(label: "xccovlib.sourceFileParsing")
-    let executionQueue = DispatchQueue.global(qos: .userInitiated)
-    func onComplete(_ block: @escaping CompletionBlockType) {
-        completionQueue.async(group: group) {
-            completionBlocks.append(block)
-        }
+    guard dlopen("/Applications/Xcode.app/Contents/Frameworks/IDEFoundation.framework/Versions/A/IDEFoundation", RTLD_LAZY) != nil else {
+        let errorString = String(validatingUTF8: dlerror())
+        throw Xccov2CoberturaError.IDEFoundationLoading(message: errorString)
     }
 
-    for sourceFilePath in viewFileList.split(separator: "\n") {
-        executionQueue.async(group: group) {
-            let sourceFilePath = String(sourceFilePath)
-            guard let viewFile = try? launchXccov(arguments: ["view", "--file", sourceFilePath, fileURL.path]) else {
-                onComplete { () -> CoverageArchive.FileReport in
-                    throw Xccov2CoberturaError.invalidXccovOutput(command: "foo") // TODO
-                }
-                return
-            }
-
-            let coveredLineHits = viewFile.split(separator: "\n").reduce([:]) { (entries, line) -> [CoverageArchive.LineNumber: CoverageArchive.Hits] in
-                // skip branch lines
-                guard let semicolonRange = line.range(of: ":") else {
-                    return entries
-                }
-
-                // skip comment lines and lines with 0 hits
-                let index = line.index(semicolonRange.upperBound, offsetBy: 1)
-                switch line[index] {
-                case "*", "0":
-                    return entries
-                default:
-                    break
-                }
-
-                // parse "X: Y" using our regular expression
-                let line = String(line)
-                guard
-                    let match = regex.firstMatch(in: line, options: [], range: NSRange(location: 0, length: line.count)),
-                    let lineNumberRange = Range(match.range(withName: "lineNumber"), in: line),
-                    let lineNumber = Int(line[lineNumberRange]),
-                    let hitsRange = Range(match.range(withName: "hits"), in: line),
-                    let hits = Int(line[hitsRange]), hits > 0
-                    else {
-                        return entries
-                }
-
-                var entries = entries
-                entries[lineNumber] = hits
-                return entries
-            }
-
-            onComplete { () -> CoverageArchive.FileReport in
-                return CoverageArchive.FileReport(filePath: sourceFilePath, hitsPerLine: coveredLineHits)
-            }
-        }
-    }
+    let coverageUnarchiverClass = unsafeBitCast(NSClassFromString("IDECoverageUnarchiver"), to: IDECoverageUnarchiver.Type.self)
+    let unarchiver = try coverageUnarchiverClass.init(archivePath: fileURL.path)
 
     var coverageArchive = CoverageArchive(coveragePerFile: [:])
-    group.wait()
-    for block in completionBlocks {
-        let fileReport = try block()
+
+    for sourceFilePath in try unarchiver.keys() {
+        var hitsPerLine: [CoverageArchive.LineNumber: CoverageArchive.Hits] = [:]
+        for coverageDataObject in try unarchiver.unarchiveCoverageLines(forKey: sourceFilePath) {
+            guard
+                let isExecutable = coverageDataObject.value(forKey: "isExecutable") as? Bool,
+                isExecutable,
+                let lineNumber = coverageDataObject.value(forKey: "lineNumber") as? Int,
+                let executionCount = coverageDataObject.value(forKey: "executionCount") as? Int,
+                executionCount > 0 else {
+                    continue
+            }
+            hitsPerLine[lineNumber] = executionCount
+        }
+        let fileReport = CoverageArchive.FileReport(filePath: sourceFilePath, hitsPerLine: hitsPerLine)
         coverageArchive.coveragePerFile[fileReport.filePath] = fileReport
     }
 
@@ -331,11 +287,11 @@ struct ResultBundleActionResult: Codable {
 
 public enum Xccov2CoberturaError: Error {
     case invalidResultBundle(message: String)
+    case IDEFoundationLoading(message: String?)
     case invalidXccovReturnValue(command: String, status: Int32)
     case invalidXccovOutput(command: String)
 }
 
-@available(OSX 10.13, *)
 public func generateCoberturaReport(fromResultBundleAt fileURL: URL) throws -> String {
     guard
         let bundle = Bundle(url: fileURL),
@@ -356,8 +312,8 @@ public func generateCoberturaReport(fromResultBundleAt fileURL: URL) throws -> S
         throw Xccov2CoberturaError.invalidResultBundle(message: "Result bundles doesn't have coverage metrics")
     }
 
-    let reportFileURL = URL(fileURLWithPath: actionResult.codeCoveragePath, relativeTo: fileURL)
-    let archiveFileURL = URL(fileURLWithPath: actionResult.codeCoverageArchivePath, relativeTo: fileURL)
+    let reportFileURL = fileURL.appendingPathComponent(actionResult.codeCoveragePath)
+    let archiveFileURL = fileURL.appendingPathComponent(actionResult.codeCoverageArchivePath)
     let sourceRootFileURL = URL(fileURLWithPath: resultBundle.creatingWorkspaceFilePath).deletingLastPathComponent()
     let coverageReport = try parseCoverageReport(at: reportFileURL)
     let coverageArchive = try parseCoverageArchive(at: archiveFileURL)
